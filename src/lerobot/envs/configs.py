@@ -1,0 +1,915 @@
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import abc
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field, fields
+from enum import StrEnum
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
+
+import draccus
+import gymnasium as gym
+
+from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.env_server import DEFAULT_MAX_PAYLOAD_BYTES
+from lerobot.processor import IsaaclabArenaProcessorStep, PolicyProcessorPipeline
+from lerobot.robots import RobotConfig
+from lerobot.sim import EnvDescriptor, SimConfig
+from lerobot.sim.integrations import envhub
+from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+
+if TYPE_CHECKING:
+    from lerobot.env_server import RemoteVectorEnv
+    from lerobot.sim import LocalVectorEnv
+
+logger = logging.getLogger(__name__)
+
+# Timeout of each request to a served env.
+SERVED_TIMEOUT_S = 120.0
+
+
+@dataclass
+class EnvClientConfig:
+    """How the client reaches the `lerobot-env-server` that runs the env."""
+
+    endpoint: str
+    # Deployment name on the server. Defaults to the env type, which is how server configs name it.
+    deployment: str | None = None
+    # Seconds to wait for the server to connect and reply before reporting that no server answered.
+    handshake_timeout_s: float = 10.0
+    # Zenoh JSON5 file with TLS and access-control settings, as for remote inference.
+    zenoh_config_path: str | None = None
+    # JPEG (at jpeg_quality) sends camera frames with less bandwidth but lower quality.
+    encoding: Literal["raw", "jpeg"] = "raw"
+    jpeg_quality: int = 90
+    # Largest reply in bytes, which carries every env's camera frames. Raise it with the server's
+    # zenoh.max_payload_bytes for large batches or high resolution cameras.
+    max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES
+
+    def __post_init__(self):
+        if self.encoding not in {"raw", "jpeg"} or not 1 <= self.jpeg_quality <= 100:
+            raise ValueError("Env server encoding must be raw or jpeg, with jpeg_quality in [1, 100]")
+
+
+@dataclass
+class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
+    task: str | None = None
+    fps: int = 30
+    # Filled from the env's descriptor when the env is created.
+    features: dict[str, PolicyFeature] = field(default_factory=dict)
+    features_map: dict[str, str] = field(default_factory=dict)
+    max_parallel_tasks: int = 1
+    disable_env_checker: bool = True
+    # Env server that runs this env, and how to reach it. When unset, the env runs locally.
+    server: EnvClientConfig | None = None
+
+    @property
+    def type(self) -> str:
+        return self.get_choice_name(self.__class__)
+
+    @property
+    def package_name(self) -> str:
+        """Package name to import if environment not found in gym registry"""
+        return f"gym_{self.type}"
+
+    @property
+    def gym_id(self) -> str:
+        """ID string used in gym.make() to instantiate the environment"""
+        return f"{self.package_name}/{self.task}"
+
+    @property
+    def gym_kwargs(self) -> dict:
+        """Keyword arguments used to build the sim's envs; empty by default."""
+        return {}
+
+    def sim_settings(self) -> dict[str, Any]:
+        """Return the sim settings, as in a server YAML's ``sim`` section; missing ones use sim defaults.
+
+        The default is the Gymnasium env ``gym_id`` with ``gym_kwargs`` and delta actions; override otherwise.
+        """
+        return _gym_settings(self, "delta")
+
+    def sim_config(self) -> SimConfig:
+        """Return ``sim_settings()`` with the sim's defaults, as local envs and the env server run it."""
+        return SimConfig.resolve(self.sim_settings())
+
+    def create_envs(
+        self,
+        n_envs: int,
+        use_async_envs: bool = False,
+    ) -> dict[str, dict[int, gym.vector.VectorEnv]]:
+        """Create local or served vector envs, as ``{suite: {task_id: env}}``."""
+        descriptor, make = self._environment_factory(n_envs, use_async_envs)
+        groups = [task.strip() for task in self.task.split(",")] if self.task else list(descriptor.tasks)
+        result = {}
+        for group in groups:
+            if group not in descriptor.tasks:
+                raise ValueError(f"Unknown task {group!r}; this environment has {sorted(descriptor.tasks)}")
+            result[group] = {task_id: make(group, task_id) for task_id in descriptor.tasks[group]}
+        return result
+
+    def create_env(
+        self,
+        task_group: str | None = None,
+        task_id: int | None = None,
+        n_envs: int = 1,
+        use_async_envs: bool = False,
+    ) -> LocalVectorEnv | RemoteVectorEnv:
+        """Create one local or served vector env for one task; no `task_id` means the suite's first task."""
+        descriptor, make = self._environment_factory(n_envs, use_async_envs, task_group, task_id)
+        group = task_group or next(iter(descriptor.tasks))
+        if group not in descriptor.tasks:
+            raise ValueError(f"Unknown task {group!r}; this environment has {sorted(descriptor.tasks)}")
+        task_ids = descriptor.tasks[group]
+        if task_id is None:
+            task_id = task_ids[0]
+        if task_id not in task_ids:
+            raise ValueError(f"Unknown task ID {task_id} for {group!r}; this suite has {sorted(task_ids)}")
+        return make(group, task_id)
+
+    def _environment_factory(
+        self,
+        n_envs: int,
+        use_async_envs: bool,
+        task_group: str | None = None,
+        task_id: int | None = None,
+    ) -> tuple[EnvDescriptor, Callable[[str, int], LocalVectorEnv | RemoteVectorEnv]]:
+        from lerobot.sim import LocalVectorEnv
+
+        settings = self.sim_settings()
+        server = self.server
+        if server is not None:
+            from lerobot.env_server import EnvClient, RemoteVectorEnv
+
+            if self.max_parallel_tasks != 1:
+                raise ValueError("A served environment runs one task at a time")
+            connect = partial(
+                EnvClient,
+                server.endpoint,
+                server.deployment or self.type,
+                SERVED_TIMEOUT_S,
+                handshake_timeout_s=server.handshake_timeout_s,
+                zenoh_config_path=server.zenoh_config_path,
+                max_payload_bytes=server.max_payload_bytes,
+            )
+            probe = connect()
+            try:
+                descriptor = probe.describe()
+            finally:
+                probe.close()
+            check_served(descriptor.config, settings, server.endpoint)
+
+            def make(group: str, task_id: int) -> LocalVectorEnv | RemoteVectorEnv:
+                return RemoteVectorEnv(
+                    connect(encoding=server.encoding, jpeg_quality=server.jpeg_quality),
+                    n_envs,
+                    group,
+                    task_id,
+                    use_async_envs and n_envs > 1,
+                    descriptor,
+                )
+        else:
+            sim = self.sim_config()
+            parallel = use_async_envs and n_envs > 1
+            # Reuse the env built to read the descriptor for its own task instead of building it twice.
+            first = [LocalVectorEnv(sim, n_envs, task_group, task_id, parallel)]
+            descriptor = first[0].descriptor
+
+            def make(group: str, task_id: int) -> LocalVectorEnv | RemoteVectorEnv:
+                if first:
+                    env = first.pop()
+                    if (group, task_id) == (env.task_group, env.task_id):
+                        return env
+                    env.close()
+                # With the descriptor given, the other tasks build their sims on first use.
+                return LocalVectorEnv(sim, n_envs, group, task_id, parallel, descriptor)
+
+        self.fps = int(descriptor.fps)
+        self.features = {
+            f.name: PolicyFeature(
+                type=FeatureType.VISUAL if f.kind == "rgb" else FeatureType.STATE, shape=f.shape
+            )
+            for f in descriptor.features
+        }
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=descriptor.action_feature.shape)
+        # Sim keys reach the policy unchanged; --rename_map renames them, as for any env.
+        self.features_map = {name: name for name in self.features}
+        return descriptor, make
+
+    def get_env_processors(self):
+        """Return (preprocessor, postprocessor) for this env. Default: identity."""
+        return PolicyProcessorPipeline(steps=[]), PolicyProcessorPipeline(steps=[])
+
+
+def check_served(served: dict[str, Any], expected: dict[str, Any], endpoint: str) -> None:
+    """Raise if the server runs a different env than ``expected``; warn if only its kwargs differ."""
+
+    def plain(value: Any) -> Any:
+        # Make YAML, wire and dataclass values comparable: tuples become lists, recursively.
+        if isinstance(value, dict):
+            return {key: plain(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plain(item) for item in value]
+        return value
+
+    # A server opens any of the tasks it configures (all of them for an empty list), so the requested tasks
+    # are checked against the descriptor's task list instead.
+    errors = [
+        f"{key}: server {served.get(key)!r}, expected {value!r}"
+        for key, value in expected.items()
+        if key not in ("kwargs", "task") and value is not None and plain(value) != plain(served.get(key))
+    ]
+    served_kwargs = served.get("kwargs") or {}
+    # hub_path and trust_remote_code may differ: the env server loads EnvHub repos from its own image.
+    warnings = [
+        f"kwargs.{key}: server {served_kwargs.get(key)!r}, expected {value!r}"
+        for key, value in (expected.get("kwargs") or {}).items()
+        if key not in ("hub_path", "trust_remote_code") and plain(value) != plain(served_kwargs.get(key))
+    ]
+    if errors:
+        raise ValueError(
+            f"The env server at {endpoint} runs another environment than this command describes "
+            f"({'; '.join(errors)}). Pass the same --env options as the server's configuration."
+        )
+    for warning in warnings:
+        logger.warning("The env server at %s differs in %s", endpoint, warning)
+
+
+@EnvConfig.register_subclass("envhub")
+@dataclass
+class HubEnvConfig(EnvConfig):
+    """An env from an EnvHub repo's ``env.py``; running it needs ``trust_remote_code``."""
+
+    hub_path: str | None = None  # required: e.g., "username/repo" or "username/repo@branch:file.py"
+    trust_remote_code: bool = False
+    # Keyword arguments for the repo's make_env, e.g. '{"episode_length": 9000}'.
+    make_env_kwargs: dict[str, Any] = field(default_factory=dict)
+    use_native_batch: bool = False
+
+    def create_envs(
+        self, n_envs: int, use_async_envs: bool = False
+    ) -> dict[str, dict[int, gym.vector.VectorEnv]]:
+        """With ``use_native_batch``, return the repo's own vector envs (e.g. GPU batches) unchanged."""
+        if not self.use_native_batch:
+            return super().create_envs(n_envs, use_async_envs)
+        if self.server is not None:
+            raise ValueError("use_native_batch runs locally; it cannot use an env server")
+        if not self.hub_path:
+            raise ValueError("--env.hub_path is required for an EnvHub environment")
+        # Provider configs (Isaac Lab Arena, Unitree G1) subclass this one and also pass themselves as `cfg`,
+        # since their options are config fields.
+        provider = None if type(self) is HubEnvConfig else self
+        return envhub.make_envs(
+            self.hub_path,
+            n_envs,
+            use_async_envs,
+            self.trust_remote_code,
+            cfg=provider,
+            **self.make_env_kwargs,
+        )
+
+    def sim_settings(self) -> dict[str, Any]:
+        if self.use_native_batch:
+            raise ValueError("use_native_batch is for batched evaluation, not SimRobot or the env server")
+        if not self.hub_path:
+            raise ValueError("--env.hub_path is required for an EnvHub environment")
+        # The repo defines the suites; --env.task picks among them.
+        return {
+            "type": "envhub",
+            "task": "",
+            "kwargs": {
+                "hub_path": self.hub_path,
+                "trust_remote_code": self.trust_remote_code,
+                "make_env_kwargs": self.make_env_kwargs,
+            },
+        }
+
+
+def _gym_settings(
+    config: EnvConfig,
+    control_mode: str,
+    state_names: tuple[str, ...] = (),
+    action_names: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Return sim settings for an env that ``gym.make`` builds from ``config.gym_id``."""
+    return {
+        "type": "gym",
+        "task": config.task,
+        "fps": config.fps,
+        "control_mode": control_mode,
+        "semantics": f"{config.type}-{control_mode.replace('_', '-')}-v1",
+        "state_names": state_names,
+        "action_names": action_names,
+        "kwargs": {
+            "gym_id": config.gym_id,
+            "gym_kwargs": config.gym_kwargs,
+            "disable_env_checker": config.disable_env_checker,
+        },
+    }
+
+
+@EnvConfig.register_subclass("aloha")
+@dataclass
+class AlohaEnvConfig(EnvConfig):
+    task: str | None = "AlohaInsertion-v0"
+    fps: int = 50
+    episode_length: int = 400
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "max_episode_steps": self.episode_length,
+        }
+
+    def sim_settings(self) -> dict[str, Any]:
+        joints = tuple(f"joint_{i}.pos" for i in range(14))
+        return {**_gym_settings(self, "position", joints, joints), "robot_type": "aloha"}
+
+
+@EnvConfig.register_subclass("pusht")
+@dataclass
+class PushtEnvConfig(EnvConfig):
+    task: str | None = "PushT-v0"
+    fps: int = 10
+    episode_length: int = 300
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    visualization_width: int = 384
+    visualization_height: int = 384
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "visualization_width": self.visualization_width,
+            "visualization_height": self.visualization_height,
+            "max_episode_steps": self.episode_length,
+        }
+
+    def sim_settings(self) -> dict[str, Any]:
+        return _gym_settings(self, "position", ("agent.x", "agent.y"), ("agent.x", "agent.y"))
+
+
+@dataclass
+class ImagePreprocessingConfig:
+    crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
+    resize_size: tuple[int, int] | None = None
+
+
+@dataclass
+class RewardClassifierConfig:
+    """Configuration for reward classification."""
+
+    pretrained_path: str | None = None
+    success_threshold: float = 0.5
+    success_reward: float = 1.0
+
+
+@dataclass
+class InverseKinematicsConfig:
+    """Configuration for inverse kinematics processing."""
+
+    urdf_path: str | None = None
+    target_frame_name: str | None = None
+    end_effector_bounds: dict[str, list[float]] | None = None
+    end_effector_step_sizes: dict[str, float] | None = None
+
+
+@dataclass
+class ObservationConfig:
+    """Configuration for observation processing."""
+
+    add_joint_velocity_to_observation: bool = False
+    add_current_to_observation: bool = False
+    add_ee_pose_to_observation: bool = False
+    display_cameras: bool = False
+
+
+@dataclass
+class GripperConfig:
+    """Configuration for gripper control and penalties."""
+
+    use_gripper: bool = True
+    gripper_penalty: float = 0.0
+
+
+@dataclass
+class ResetConfig:
+    """Configuration for environment reset behavior."""
+
+    fixed_reset_joint_positions: list[float] | None = None
+    reset_time_s: float = 5.0
+    control_time_s: float = 20.0
+    terminate_on_success: bool = True
+
+
+@dataclass
+class HILSerlProcessorConfig:
+    """Configuration for environment processing pipeline."""
+
+    control_mode: str = "gamepad"
+    observation: ObservationConfig | None = None
+    image_preprocessing: ImagePreprocessingConfig | None = None
+    gripper: GripperConfig | None = None
+    reset: ResetConfig | None = None
+    inverse_kinematics: InverseKinematicsConfig | None = None
+    reward_classifier: RewardClassifierConfig | None = None
+    max_gripper_pos: float | None = 100.0
+
+
+@EnvConfig.register_subclass(name="gym_manipulator")
+@dataclass
+class HILSerlRobotEnvConfig(EnvConfig):
+    """Configuration for the HILSerlRobotEnv environment."""
+
+    robot: RobotConfig | None = None
+    teleop: TeleoperatorConfig | None = None
+    processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
+
+    name: str = "real_robot"
+
+    def sim_settings(self) -> dict[str, Any]:
+        raise NotImplementedError("gym_manipulator wraps a robot for RL; it does not describe a simulator")
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        """Raise: this config drives a real robot, which `make_env` and `lerobot-eval` cannot build."""
+        raise NotImplementedError(
+            "'gym_manipulator' is a real-robot environment: make_env and lerobot-eval cannot build it. "
+            "Run it with `python -m lerobot.rl.gym_manipulator --config_path <config.json>`, and evaluate a "
+            "policy on the robot with `python -m lerobot.rl.eval_policy --config_path <config.json>`. "
+            "See https://huggingface.co/docs/lerobot/hilserl"
+        )
+
+
+@EnvConfig.register_subclass("libero")
+@dataclass
+class LiberoEnvConfig(EnvConfig):
+    task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
+    task_ids: list[int] | None = None
+    fps: int = 20  # Must match robosuite's default control_freq (20 Hz)
+    episode_length: int | None = None
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    camera_name: str = "agentview_image,robot0_eye_in_hand_image"
+    init_states: bool = True
+    hard_reset: bool = True
+    # Raw camera name -> observation name. Default: agentview_image -> image,
+    # robot0_eye_in_hand_image -> image2.
+    camera_name_mapping: dict[str, str] | None = None
+    observation_height: int = 360
+    observation_width: int = 360
+    is_libero_plus: bool = False
+    control_mode: str = "relative"  # or "absolute"
+
+    def __post_init__(self):
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}")
+        if not self.hard_reset and not self.init_states:
+            raise ValueError("hard_reset=False requires init_states=True")
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs: dict[str, Any] = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "control_freq": self.fps,
+            "hard_reset": self.hard_reset,
+        }
+        if self.task_ids is not None:
+            kwargs["task_ids"] = self.task_ids
+        return kwargs
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "task": self.task,
+            "fps": self.fps,
+            "kwargs": {
+                "gym_kwargs": self.gym_kwargs,
+                "camera_name": self.camera_name,
+                "init_states": self.init_states,
+                "control_mode": self.control_mode,
+                "episode_length": self.episode_length,
+                "camera_name_mapping": self.camera_name_mapping,
+                "is_libero_plus": self.is_libero_plus,
+            },
+        }
+
+
+@EnvConfig.register_subclass("metaworld")
+@dataclass
+class MetaworldEnvConfig(EnvConfig):
+    task: str = "metaworld-push-v3"  # add all tasks
+    fps: int = 80
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+
+    def __post_init__(self):
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+        }
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {"type": "metaworld", "task": self.task, "kwargs": {"gym_kwargs": self.gym_kwargs}}
+
+
+@EnvConfig.register_subclass("robocasa")
+@dataclass
+class RoboCasaEnvConfig(EnvConfig):
+    task: str = "CloseFridge"
+    fps: int = 20
+    episode_length: int | None = None
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    # Observation names use the raw RoboCasa camera names (`observation.images.robot0_agentview_left`), as
+    # the RoboCasa datasets on the Hub do, so policies trained on them need no `--rename_map`.
+    camera_name: str = "robot0_agentview_left,robot0_eye_in_hand,robot0_agentview_right"
+    observation_height: int = 256
+    observation_width: int = 256
+    visualization_height: int = 512
+    visualization_width: int = 512
+    split: str | None = None
+    # Object-mesh registries to sample from. Upstream default is
+    # ("objaverse", "lightwheel"), but objaverse is ~30GB and the CI image
+    # only ships the lightwheel pack. Override to include objaverse once
+    # you've run `python -m robocasa.scripts.download_kitchen_assets
+    # --type objaverse` locally.
+    obj_registries: list[str] = field(default_factory=lambda: ["lightwheel"])
+
+    def __post_init__(self):
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        kwargs: dict[str, Any] = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "visualization_height": self.visualization_height,
+            "visualization_width": self.visualization_width,
+        }
+        if self.split is not None:
+            kwargs["split"] = self.split
+        return kwargs
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {
+            "type": "robocasa",
+            "task": self.task,
+            "kwargs": {
+                "gym_kwargs": self.gym_kwargs,
+                "camera_name": self.camera_name,
+                "episode_length": self.episode_length,
+                "obj_registries": list(self.obj_registries),
+            },
+        }
+
+
+@EnvConfig.register_subclass("vlabench")
+@dataclass
+class VLABenchEnvConfig(EnvConfig):
+    task: str = "select_fruit"
+    fps: int = 10
+    episode_length: int = 500
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    render_resolution: tuple[int, int] = (480, 480)
+    robot: str = "franka"
+    action_mode: str = "eef"
+
+    def __post_init__(self):
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "render_resolution": list(self.render_resolution),
+            "robot": self.robot,
+            "max_episode_steps": self.episode_length,
+            "action_mode": self.action_mode,
+        }
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {"type": "vlabench", "task": self.task, "kwargs": {"gym_kwargs": self.gym_kwargs}}
+
+
+@EnvConfig.register_subclass("isaaclab_arena")
+@dataclass
+class IsaaclabArenaEnvConfig(HubEnvConfig):
+    hub_path: str = "nvidia/isaaclab-arena-envs"
+    # Run the repo's own vector env locally, as an EnvHub native batch.
+    use_native_batch: bool = True
+    episode_length: int = 300
+    num_envs: int = 1
+    embodiment: str | None = "gr1_pink"
+    object: str | None = "power_drill"
+    mimic: bool = False
+    teleop_device: str | None = None
+    seed: int | None = 42
+    device: str | None = "cuda:0"
+    disable_fabric: bool = False
+    enable_cameras: bool = False
+    headless: bool = False
+    enable_pinocchio: bool = True
+    environment: str | None = "gr1_microwave"
+    task: str | None = "Reach out to the microwave and open it."
+    state_dim: int = 54
+    action_dim: int = 36
+    camera_height: int = 512
+    camera_width: int = 512
+    video: bool = False
+    video_length: int = 100
+    video_interval: int = 200
+    # Comma-separated keys, e.g., "robot_joint_pos,left_eef_pos"
+    state_keys: str = "robot_joint_pos"
+    # Comma-separated keys, e.g., "robot_pov_cam_rgb,front_cam_rgb"
+    # Set to None or "" for environments without cameras
+    camera_keys: str | None = None
+    features: dict[str, PolicyFeature] = field(default_factory=dict)
+    features_map: dict[str, str] = field(default_factory=dict)
+    kwargs: dict | None = None
+
+    def __post_init__(self):
+        if self.make_env_kwargs:
+            raise ValueError(f"--env.type={self.type} is configured by its own options, not make_env_kwargs")
+        if self.kwargs:
+            # dynamically convert kwargs to fields in the dataclass
+            # NOTE! the new fields will not bee seen by the dataclass repr
+            field_names = {f.name for f in fields(self)}
+            for key, value in self.kwargs.items():
+                if key not in field_names and key != "kwargs":
+                    setattr(self, key, value)
+            self.kwargs = None
+
+        # Set action feature
+        self.features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))
+        self.features_map[ACTION] = ACTION
+
+        # Set state feature
+        self.features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(self.state_dim,))
+        self.features_map[OBS_STATE] = OBS_STATE
+
+        # Add camera features for each camera key
+        if self.enable_cameras and self.camera_keys:
+            for cam_key in self.camera_keys.split(","):
+                cam_key = cam_key.strip()
+                if cam_key:
+                    self.features[cam_key] = PolicyFeature(
+                        type=FeatureType.VISUAL,
+                        shape=(self.camera_height, self.camera_width, 3),
+                    )
+                    self.features_map[cam_key] = f"{OBS_IMAGES}.{cam_key}"
+
+    def get_env_processors(self):
+        state_keys = tuple(k.strip() for k in (self.state_keys or "").split(",") if k.strip())
+        camera_keys = tuple(k.strip() for k in (self.camera_keys or "").split(",") if k.strip())
+        if not state_keys and not camera_keys:
+            raise ValueError("At least one of state_keys or camera_keys must be specified.")
+        return (
+            PolicyProcessorPipeline(
+                steps=[IsaaclabArenaProcessorStep(state_keys=state_keys, camera_keys=camera_keys)]
+            ),
+            PolicyProcessorPipeline(steps=[]),
+        )
+
+
+class G1EndEffector(StrEnum):
+    """What the G1's arms carry, by hardware name.
+
+    Shared with UnitreeG1Config, which owns the robot-level flag.
+    """
+
+    DUMMY = "dummy"  # bare wrists
+    DEX1 = "dex1"  # parallel grippers
+    DEX3 = "dex3"  # three-finger hands
+
+    @classmethod
+    def _missing_(cls, value: object) -> None:
+        raise ValueError(f"`end_effector` is expected to be in {list(cls)}, but {value} is provided.")
+
+
+@EnvConfig.register_subclass("unitree_g1_mujoco")
+@dataclass
+class UnitreeG1MujocoEnvConfig(HubEnvConfig):
+    """Config for the MuJoCo simulation of the Unitree G1.
+
+    The end effector selects the MuJoCo model, and with it the finger actuators and the
+    wrist cameras that exist: "dummy" for bare wrists, "dex1" for the parallel grippers,
+    "dex3" for the three-finger hands.
+
+    The sim renders either its cameras or its window, never both: the offscreen contexts
+    are bound to the thread that creates them, which is not the one driving the viewer.
+    `onscreen` is therefore resolved from `publish_images` unless it is set explicitly.
+    """
+
+    hub_path: str = "lerobot/unitree-g1-mujoco"
+    # Run the repo's own vector env locally, as an EnvHub native batch.
+    use_native_batch: bool = True
+    end_effector: G1EndEffector = G1EndEffector.DEX1
+    publish_images: bool = True
+    camera_port: int = 5555
+    onscreen: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.make_env_kwargs:
+            raise ValueError(f"--env.type={self.type} is configured by its own options, not make_env_kwargs")
+        self.end_effector = G1EndEffector(self.end_effector)
+        if self.onscreen is None:
+            self.onscreen = not self.publish_images
+        elif self.onscreen and self.publish_images:
+            raise ValueError(
+                "The G1 sim cannot publish camera images and open its viewer in the same "
+                "process. Set publish_images=False to watch the window, or onscreen=False "
+                "to take the image stream."
+            )
+
+
+@EnvConfig.register_subclass("libero_plus")
+@dataclass
+class LiberoPlusEnvConfig(LiberoEnvConfig):
+    """Config for LIBERO-plus robustness benchmark evaluation.
+
+    LIBERO-plus extends LIBERO with 7 perturbation dimensions (camera viewpoints,
+    object layouts, robot initial states, language instructions, lighting, background
+    textures, sensor noise) producing ~10k task variants.
+
+    The gym interface is identical to LIBERO so this class reuses ``LiberoEnvConfig``
+    entirely — only the registered name and default task suite differ.
+
+    Install: see the libero_plus_native stage of docker/Dockerfile.sim — LIBERO-plus ships
+    as a namespace package from a git fork and must be cloned + PYTHONPATH'd
+    rather than installed as a pyproject extra.
+
+    See Also:
+        https://github.com/sylvestf/LIBERO-plus
+    """
+
+    task: str = "libero_spatial"
+    is_libero_plus: bool = True
+
+
+@EnvConfig.register_subclass("robocerebra")
+@dataclass
+class RoboCerebraEnvConfig(LiberoEnvConfig):
+    """RoboCerebra long-horizon tasks on LIBERO scenes, using its datasets' camera names and image size."""
+
+    task: str = "libero_10"
+    observation_height: int = 256
+    observation_width: int = 256
+    camera_name_mapping: dict[str, str] | None = field(
+        default_factory=lambda: {"agentview_image": "image", "robot0_eye_in_hand_image": "wrist_image"}
+    )
+
+
+@EnvConfig.register_subclass("robotwin")
+@dataclass
+class RoboTwinEnvConfig(EnvConfig):
+    """Configuration for RoboTwin 2.0 benchmark environments.
+
+    RoboTwin 2.0 is a dual-arm manipulation benchmark with 50 tasks built on the
+    SAPIEN simulator. The robot is an Aloha-AgileX bimanual platform with 14 DOF
+    (7 per arm). All three cameras are enabled by default.
+
+    See: https://robotwin-platform.github.io
+    Dataset: https://huggingface.co/datasets/lerobot/robotwin_unified
+    """
+
+    task: str = "beat_block_hammer"  # single task or comma-separated list
+    fps: int = 25
+    episode_length: int = 1200
+    # Available cameras from RoboTwin's aloha-agilex embodiment: head_camera
+    # (torso-mounted) + left_camera / right_camera (wrists).
+    camera_names: str = "head_camera,left_camera,right_camera"
+    # Match the D435 size in task_config/demo_clean.yml (_camera_config.yml). It must equal what SAPIEN
+    # renders, since observations are checked against the declared shape.
+    observation_height: int = 240
+    observation_width: int = 320
+    # "joint": 14-d joint-space control. "ee": 16-d end-effector-pose deltas executed via CuRobo IK
+    # (for world-model policies like LingBot-VA that predict per-arm xyz+quaternion+gripper poses).
+    action_mode: str = "joint"
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {
+            "type": "robotwin",
+            "task": self.task,
+            "kwargs": {
+                "camera_names": [c.strip() for c in self.camera_names.split(",") if c.strip()],
+                "observation_height": self.observation_height,
+                "observation_width": self.observation_width,
+                "episode_length": self.episode_length,
+                "action_mode": self.action_mode,
+            },
+        }
+
+
+@EnvConfig.register_subclass("robomme")
+@dataclass
+class RoboMMEEnvConfig(EnvConfig):
+    """RoboMME memory-augmented manipulation benchmark (ManiSkill/SAPIEN).
+
+    16 tasks across 4 suites: Counting, Permanence, Reference, Imitation.
+    Dataset: lerobot/robomme (LeRobot v3.0, 1,600 episodes).
+    Benchmark: https://github.com/RoboMME/robomme_benchmark
+
+    Requires the `robomme` git package installed separately (Linux only);
+    see the robomme_native stage of docker/Dockerfile.sim for how to install it.
+    """
+
+    task: str = "PickXtimes"
+    fps: int = 10
+    episode_length: int = 300
+    action_space: str = "joint_angle"  # or "ee_pose" (7-D)
+    dataset_split: str = "test"  # "train" | "val" | "test"
+    task_ids: list[int] | None = None
+    front_camera_name: str = "camera1"
+    wrist_camera_name: str = "camera2"
+
+    def __post_init__(self):
+        if self.front_camera_name == self.wrist_camera_name:
+            raise ValueError("RoboMME front and wrist camera names must be distinct.")
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {
+            "type": "robomme",
+            "task": self.task,
+            "kwargs": {
+                "action_space_type": self.action_space,
+                "dataset": self.dataset_split,
+                "episode_length": self.episode_length,
+                "task_ids": self.task_ids,
+                "front_camera_name": self.front_camera_name,
+                "wrist_camera_name": self.wrist_camera_name,
+            },
+        }
+
+
+@EnvConfig.register_subclass("robolab")
+@dataclass
+class RoboLabEnvConfig(EnvConfig):
+    """NVIDIA RoboLab: 120 tabletop tasks for a DROID robot (Franka + Robotiq 2F-85), on Isaac Lab.
+
+    Each task is its own suite; `task` is a comma-separated list of task names, or empty for all 120. The envs of a
+    task share one Isaac Lab world on the GPU. Actions are 7 absolute joint positions and a gripper command (closed
+    above 0.5), at 15 Hz.
+
+    Requires Isaac Sim and RoboLab, best run from the robolab_native stage of docker/Dockerfile.sim.
+    Benchmark: https://github.com/NVlabs/RoboLab
+    """
+
+    task: str | None = None
+    fps: int = 15
+    # A camera preset of robolab.registrations.droid.camera_presets, e.g. WRIST_LEFT or WRIST_LEFT_RIGHT.
+    cameras: str = "WRIST_LEFT"
+    # Which of each task's instructions the policy gets: default, vague or specific.
+    instruction_type: str = "default"
+    # Resize camera frames on the GPU before sending them; RoboLab renders 1280x720.
+    observation_height: int | None = None
+    observation_width: int | None = None
+
+    def sim_settings(self) -> dict[str, Any]:
+        return {
+            "type": "robolab",
+            "task": self.task or "",
+            "kwargs": {
+                "cameras": self.cameras,
+                "instruction_type": self.instruction_type,
+                "observation_height": self.observation_height,
+                "observation_width": self.observation_width,
+            },
+        }

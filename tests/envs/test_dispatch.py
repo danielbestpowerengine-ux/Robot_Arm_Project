@@ -1,0 +1,231 @@
+"""Tests for the benchmark dispatch refactor (create_envs / get_env_processors on EnvConfig)."""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass, field
+
+import gymnasium as gym
+import pytest
+import torch
+from gymnasium.envs.registration import register, registry as gym_registry
+
+from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.envs.configs import EnvConfig, LiberoEnvConfig
+from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors
+from lerobot.policies.cosmos3.processor_cosmos3 import make_cosmos3_libero_pre_post_processors
+from lerobot.processor import LiberoProcessorStep
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_PREFIX, OBS_STATE
+from tests.fixtures.toy_env import DictObservationEnv
+
+logger = logging.getLogger(__name__)
+
+
+def test_registry_all_types():
+    """make_env_config should resolve every registered EnvConfig subclass via the registry."""
+    known = list(EnvConfig.get_known_choices().keys())
+    assert len(known) >= 6
+    for t in known:
+        cfg = make_env_config(t)
+        if not isinstance(cfg, EnvConfig):
+            continue
+        assert cfg.type == t
+
+
+def test_unknown_type():
+    with pytest.raises(ValueError, match="not registered"):
+        make_env_config("nonexistent")
+
+
+def test_libero_fps_controls_simulator_frequency():
+    cfg = LiberoEnvConfig(fps=17)
+
+    assert cfg.gym_kwargs["control_freq"] == 17
+
+
+def test_libero_rejects_nonpositive_fps():
+    with pytest.raises(ValueError, match="fps must be positive"):
+        LiberoEnvConfig(fps=0)
+
+
+def test_identity_processors():
+    """Base class get_env_processors() returns identity pipelines."""
+    cfg = make_env_config("aloha")
+    pre, post = cfg.get_env_processors()
+    assert len(pre.steps) == 0 and len(post.steps) == 0
+
+
+def test_delegation():
+    """make_env() should call cfg.create_envs(), not use if/elif dispatch."""
+    sentinel = {"delegated": {0: "marker"}}
+    fake = type(
+        "Fake",
+        (),
+        {
+            "hub_path": None,
+            "create_envs": lambda self, n_envs, use_async_envs=False: sentinel,
+        },
+    )()
+    result = make_env(fake, n_envs=1)
+    assert result is sentinel
+
+
+def test_processors_delegation():
+    """make_env_pre_post_processors delegates to cfg.get_env_processors()."""
+    cfg = make_env_config("aloha")
+    pre, post = make_env_pre_post_processors(cfg, policy_cfg=None)
+    assert len(pre.steps) == 0
+
+
+def test_libero_processors_are_identity():
+    # LIBERO observations are canonical (flipped images, flat state) before they reach any processor.
+    pre, post = make_env_pre_post_processors(LiberoEnvConfig(), policy_cfg=object())
+
+    assert len(pre.steps) == 0 and len(post.steps) == 0
+    # A Cosmos3 policy only decodes its action there.
+    pre, post = make_cosmos3_libero_pre_post_processors()
+    assert len(pre.steps) == 0 and len(post.steps) == 1
+
+
+def test_libero_processor_transform_features_replaces_state_components():
+    step = LiberoProcessorStep()
+    image = PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3))
+    action = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+    features = {
+        PipelineFeatureType.OBSERVATION: {
+            f"{OBS_IMAGES}.image": image,
+            f"{OBS_STATE}.eef_pos": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+            f"{OBS_STATE}.gripper_qpos": PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        PipelineFeatureType.ACTION: action,
+    }
+
+    out = step.transform_features(features)
+
+    assert set(out) == {PipelineFeatureType.OBSERVATION, PipelineFeatureType.ACTION}
+    assert out[PipelineFeatureType.OBSERVATION] == {
+        f"{OBS_IMAGES}.image": image,
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+    }
+    assert out[PipelineFeatureType.ACTION] == action
+
+
+def test_libero_processor_flattens_state_to_raw_8_dim():
+    step = LiberoProcessorStep()
+    observation = {
+        OBS_PREFIX + "robot_state": {
+            "eef": {
+                "pos": torch.tensor([[1.0, 2.0, 3.0]]),
+                "quat": torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
+            },
+            "gripper": {"qpos": torch.tensor([[4.0, 5.0]])},
+        }
+    }
+
+    state = step.observation(observation)[OBS_STATE]
+    assert state.shape == (1, 8)
+    assert torch.allclose(state, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0]]))
+
+
+def test_base_create_envs():
+    """Base class create_envs() should build a single-task LocalVectorEnv via gym.make()."""
+    gym_id = "_dispatch_test/CartPole-v99"
+    if gym_id not in gym_registry:
+        register(id=gym_id, entry_point=DictObservationEnv)
+
+    @EnvConfig.register_subclass("_dispatch_base_test")
+    @dataclass
+    class _Env(EnvConfig):
+        task: str = "CartPole-v99"
+        fps: int = 10
+        features: dict[str, PolicyFeature] = field(default_factory=dict)
+
+        @property
+        def package_name(self):
+            return "_dispatch_test"
+
+        @property
+        def gym_id(self):
+            return gym_id
+
+        @property
+        def gym_kwargs(self):
+            return {}
+
+    try:
+        envs = _Env().create_envs(n_envs=2)
+        # One suite, named by the gym task.
+        assert list(envs) == ["CartPole-v99"]
+        env = envs["CartPole-v99"][0]
+        assert isinstance(env, gym.vector.VectorEnv)
+        assert env.num_envs == 2
+        env.close()
+    finally:
+        if gym_id in gym_registry:
+            del gym_registry[gym_id]
+
+
+def test_custom_create_envs_override():
+    """A custom EnvConfig subclass can override create_envs()."""
+    mock_vec = gym.vector.SyncVectorEnv([lambda: gym.make("CartPole-v1")])
+
+    @EnvConfig.register_subclass("_dispatch_custom_test")
+    @dataclass
+    class _Env(EnvConfig):
+        task: str = "x"
+        features: dict[str, PolicyFeature] = field(default_factory=dict)
+
+        @property
+        def gym_kwargs(self):
+            return {}
+
+        def create_envs(self, n_envs, use_async_envs=False):
+            return {"custom_suite": {0: mock_vec}}
+
+    try:
+        result = make_env(_Env(), n_envs=1)
+        assert "custom_suite" in result
+    finally:
+        mock_vec.close()
+
+
+def test_custom_get_env_processors_override():
+    """A custom EnvConfig subclass can override get_env_processors()."""
+    from lerobot.processor.pipeline import DataProcessorPipeline
+
+    @EnvConfig.register_subclass("_dispatch_proc_test")
+    @dataclass
+    class _Env(EnvConfig):
+        task: str = "x"
+        features: dict[str, PolicyFeature] = field(default_factory=dict)
+
+        @property
+        def gym_kwargs(self):
+            return {}
+
+        def get_env_processors(self):
+            return DataProcessorPipeline(steps=[]), DataProcessorPipeline(steps=[])
+
+    pre, post = _Env().get_env_processors()
+    assert isinstance(pre, DataProcessorPipeline)
+
+
+def test_xvla_libero_processors_build_its_input():
+    from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+
+    pre, _ = make_env_pre_post_processors(LiberoEnvConfig(), XVLAConfig())
+    step = pre.steps[0]
+    rotated = torch.rand(1, 3, 4, 4)
+    state = torch.tensor([[0.1, 0.2, 0.3, 0.0, 0.0, math.pi / 2, 0.04, -0.04]])
+
+    out = step.observation(
+        {f"{OBS_IMAGES}.image": rotated, f"{OBS_IMAGES}.image2": rotated, OBS_STATE: state}
+    )
+
+    assert torch.equal(out[f"{OBS_IMAGES}.image"], rotated)
+    assert torch.equal(out[f"{OBS_IMAGES}.image2"], torch.flip(rotated, dims=[2, 3]))
+    # A quarter turn about z in the frame of the quaternion is the identity in the controller frame.
+    torch.testing.assert_close(out[OBS_STATE], torch.tensor([[0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]))
+    with pytest.raises(ValueError, match="8 wide"):
+        step.observation({OBS_STATE: torch.zeros(1, 20)})
